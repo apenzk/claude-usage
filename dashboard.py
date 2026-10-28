@@ -474,11 +474,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="filter-label">Range</div>
   <div class="range-select">
     <select id="range-select" aria-label="Date range" onchange="setRange(this.value)">
-      <option value="24h">Last 24 Hours</option>
       <option value="today">Today</option>
       <option value="week">This Week</option>
       <option value="month">This Month</option>
       <option value="prev-month">Previous Month</option>
+      <option value="24h">Last 24 Hours</option>
       <option value="7d">Last 7 Days</option>
       <option value="30d">Last 30 Days</option>
       <option value="90d">Last 90 Days</option>
@@ -891,8 +891,8 @@ function legendToggle(key) {
 }
 
 // ── Time range ─────────────────────────────────────────────────────────────
-const RANGE_LABELS = { '24h': 'Last 24 Hours', 'today': 'Today', 'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
-const RANGE_TICKS  = { '24h': 12, 'today': 1, 'week': 7, 'month': 15, 'prev-month': 15, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
+const RANGE_LABELS = { 'today': 'Today', 'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month', '24h': 'Last 24 Hours', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
+const RANGE_TICKS  = { 'today': 1, 'week': 7, 'month': 15, 'prev-month': 15, '24h': 12, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
 const VALID_RANGES = Object.keys(RANGE_LABELS);
 
 // Local calendar date as YYYY-MM-DD. NOT toISOString(), which formats in UTC and
