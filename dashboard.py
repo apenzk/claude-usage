@@ -86,7 +86,10 @@ def get_dashboard_data(db_path=DB_PATH):
             substr(timestamp, 1, 10)                  as day,
             CAST(substr(timestamp, 12, 2) AS INTEGER) as hour,
             COALESCE(NULLIF(model, ''), 'unknown')    as model,
+            SUM(input_tokens)                         as input,
             SUM(output_tokens)                        as output,
+            SUM(cache_read_tokens)                    as cache_read,
+            SUM(cache_creation_tokens)                as cache_creation,
             COUNT(*)                                  as turns
         FROM turns
         WHERE timestamp IS NOT NULL AND length(timestamp) >= 13
@@ -98,8 +101,11 @@ def get_dashboard_data(db_path=DB_PATH):
         "day":    r["day"],
         "hour":   r["hour"] if r["hour"] is not None else 0,
         "model":  r["model"],
-        "output": r["output"] or 0,
-        "turns":  r["turns"] or 0,
+        "input":          r["input"] or 0,
+        "output":         r["output"] or 0,
+        "cache_read":     r["cache_read"] or 0,
+        "cache_creation": r["cache_creation"] or 0,
+        "turns":          r["turns"] or 0,
     } for r in hourly_rows]
 
     # ── All sessions (client filters by range and model) ──────────────────────
@@ -325,6 +331,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .stat-card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
   .stat-card .value { font-size: 22px; font-weight: 700; }
   .stat-card .sub { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .info-btn { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; margin-left: 6px; border: 1px solid var(--muted); border-radius: 50%; background: none; color: var(--muted); font: italic 700 10px/1 serif; cursor: pointer; padding: 0; vertical-align: middle; text-transform: none; }
+  .info-btn:hover, .info-btn.open { color: var(--text, #fff); border-color: var(--text, #fff); }
+  .info-pop { position: absolute; z-index: 50; width: 380px; max-width: calc(100vw - 24px); background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; color: var(--muted); font-size: 12px; line-height: 1.5; box-shadow: 0 6px 24px rgba(0,0,0,0.5); }
+  .info-pop a { color: var(--muted); }
 
   .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
   /* min-width:0 lets the grid column shrink below the canvas's intrinsic
@@ -464,6 +474,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="filter-label">Range</div>
   <div class="range-select">
     <select id="range-select" aria-label="Date range" onchange="setRange(this.value)">
+      <option value="24h">Last 24 Hours</option>
       <option value="today">Today</option>
       <option value="week">This Week</option>
       <option value="month">This Month</option>
@@ -880,8 +891,8 @@ function legendToggle(key) {
 }
 
 // ── Time range ─────────────────────────────────────────────────────────────
-const RANGE_LABELS = { 'today': 'Today', 'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
-const RANGE_TICKS  = { 'today': 1, 'week': 7, 'month': 15, 'prev-month': 15, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
+const RANGE_LABELS = { '24h': 'Last 24 Hours', 'today': 'Today', 'week': 'This Week', 'month': 'This Month', 'prev-month': 'Previous Month', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
+const RANGE_TICKS  = { '24h': 12, 'today': 1, 'week': 7, 'month': 15, 'prev-month': 15, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
 const VALID_RANGES = Object.keys(RANGE_LABELS);
 
 // Local calendar date as YYYY-MM-DD. NOT toISOString(), which formats in UTC and
@@ -903,6 +914,9 @@ function getRangeBounds(range) {
   if (range === 'all') return { start: null, end: null };
   const today = new Date();
   const iso = localISODate;
+  if (range === '24h') {
+    return { start: new Date(Date.now() - 864e5).toISOString().slice(0, 10), end: null };
+  }
   if (range === 'today') {
     const t = iso(today);
     return { start: t, end: t };
@@ -1171,15 +1185,33 @@ function applyFilter() {
   const { start, end } = getRangeBounds(selectedRange);
 
   // Filter daily rows by model + date range
-  const filteredDaily = rawData.daily_by_model.filter(r =>
+  // The 24h range works on hourly buckets: keep the buckets whose hour began
+  // after (now - 24h), floored to the hour.
+  const in24h = r => Date.parse(r.day + 'T' + String(r.hour).padStart(2, '0') + ':00:00Z') > Date.now() - 864e5 - 36e5 + 1;
+  const dailySrc = selectedRange === '24h'
+    ? (rawData.hourly_by_model || []).filter(in24h)
+    : rawData.daily_by_model;
+  const filteredDaily = dailySrc.filter(r =>
     selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end)
   );
 
   // Daily chart: aggregate by day
   const dailyMap = {};
+  const is24h = selectedRange === '24h';
+  const bucketKey = r => is24h ? r.day + 'T' + String(r.hour).padStart(2, '0') : r.day;
+  if (is24h) {
+    // Pre-seed all 24 hourly buckets so hours without data still show on the axis.
+    const cur = Math.floor(Date.now() / 36e5) * 36e5;
+    for (let i = 23; i >= 0; i--) {
+      const t = new Date(cur - i * 36e5);
+      const key = t.toISOString().slice(0, 13);
+      dailyMap[key] = { day: key, label: String(t.getHours()).padStart(2, '0') + ':00', input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0 };
+    }
+  }
   for (const r of filteredDaily) {
-    if (!dailyMap[r.day]) dailyMap[r.day] = { day: r.day, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0 };
-    const d = dailyMap[r.day];
+    const k = bucketKey(r);
+    if (!dailyMap[k]) dailyMap[k] = { day: k, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0 };
+    const d = dailyMap[k];
     d.input          += r.input;
     d.output         += r.output;
     d.cache_read     += r.cache_read;
@@ -1260,6 +1292,7 @@ function applyFilter() {
   // Hourly aggregation (filtered by model + range, then bucketed by UTC hour)
   const hourlySrc = (rawData.hourly_by_model || []).filter(r =>
     selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end)
+    && (selectedRange !== '24h' || in24h(r))
   );
   const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ);
 
@@ -1311,8 +1344,39 @@ function applyFilter() {
 }
 
 // ── Renderers ──────────────────────────────────────────────────────────────
+// Estimated compute cost to Anthropic of serving these tokens: a share of the
+// API list-price cost. SemiAnalysis puts inference margins at 70-88%, so the
+// cost to serve is 12-30% of revenue; 20% is the default.
+function estimateRealCost(listCost) {
+  const share = Number(APP_CONFIG.cost_share) || 0;
+  return { cost: listCost * share, sub: Math.round(share * 100) + '% of API list price' };
+}
+
+let costInfo = {};
+document.addEventListener('click', e => {
+  const old = document.querySelector('.info-pop');
+  const btn = e.target.closest && e.target.closest('.info-btn');
+  const inPop = e.target.closest && e.target.closest('.info-pop');
+  if (inPop) return;
+  const wasOwn = old && btn && old._owner === btn.closest('.stat-card').querySelector('.label').firstChild.textContent;
+  if (old) { old.remove(); document.querySelectorAll('.info-btn.open').forEach(b => b.classList.remove('open')); }
+  if (!btn || wasOwn) return;
+  const pop = document.createElement('div');
+  pop.className = 'info-pop';
+  pop._owner = btn.closest('.stat-card').querySelector('.label').firstChild.textContent;
+  pop.innerHTML = costInfo[pop._owner] || '';
+  document.body.appendChild(pop);
+  const r = btn.getBoundingClientRect();
+  const left = Math.max(12, Math.min(r.left + window.scrollX, window.scrollX + document.documentElement.clientWidth - pop.offsetWidth - 12));
+  pop.style.left = left + 'px';
+  pop.style.top = (r.bottom + window.scrollY + 8) + 'px';
+  btn.classList.add('open');
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { const p = document.querySelector('.info-pop'); if (p) p.remove(); } });
+
 function renderStats(t) {
   const rangeLabel = RANGE_LABELS[selectedRange].toLowerCase();
+  const real = estimateRealCost(t.cost);
   const stats = [
     { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: rangeLabel },
     { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel },
@@ -1321,11 +1385,26 @@ function renderStats(t) {
     { label: 'Subagent Tokens', value: fmt(t.subagent_tokens || 0), sub: 'included in totals' },
     { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
     { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
-    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, June 2026', color: C.green },
+    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, June 2026', color: C.green, info: true },
+    { label: 'Est. Real Cost', value: fmtCostBig(real.cost),       sub: real.sub, color: C.green, info: true },
   ];
+  costInfo = {
+    'Est. Cost':
+      '<strong>Est. Cost</strong> prices every token at Anthropic\u2019s public API list prices, so it is what the same usage would cost on the API. ' +
+      'The list prices in this tool may be off by about 20% for newer models. ' +
+      'It ignores what you pay for a subscription.',
+    'Est. Real Cost':
+      '<strong>Est. Real Cost</strong> estimates what serving those tokens costs Anthropic in compute: ' + esc(real.sub) + '. ' +
+      'The share comes from analyst estimates of Anthropic\u2019s inference margin, ' +
+      '<a href="https://www.mindstudio.ai/blog/anthropic-inference-margins-70-percent-api-costs" target="_blank">70%</a> to ' +
+      '<a href="https://cryptobriefing.com/anthropic-inference-margins-semianalysis-88-percent/" target="_blank">88%</a> (SemiAnalysis), ' +
+      'which puts the cost to serve at 12\u201330% of list price. ' +
+      'The default is 20%, and you can change it with <code>CLAUDE_USAGE_COST_SHARE</code>. ' +
+      'It is a guess: Anthropic publishes no per-token cost.'
+  };
   document.getElementById('stats-row').innerHTML = stats.map(s => `
     <div class="stat-card">
-      <div class="label">${s.label}</div>
+      <div class="label">${s.label}${s.info ? '<button class="info-btn" type="button" aria-label="About cost estimates" data-info="cost">i</button>' : ''}</div>
       <div class="value" style="${s.color ? 'color:' + s.color : ''}">${esc(s.value)}</div>
       ${s.sub ? `<div class="sub">${esc(s.sub)}</div>` : ''}
     </div>
@@ -1447,7 +1526,7 @@ function renderDailyChart(daily) {
   charts.daily = new Chart(ctx, {
     type: 'bar',
     data: {
-      labels: daily.map(d => d.day),
+      labels: daily.map(d => d.label || d.day),
       datasets: [
         { label: 'Input',          hidden: hiddenSeries.daily.has('Input'),          data: daily.map(d => d.input),          backgroundColor: TOKEN_COLORS.input,          hoverBackgroundColor: TOKEN_HOVER.input,          stack: 'io',    yAxisID: 'y1' },
         { label: 'Output',         hidden: hiddenSeries.daily.has('Output'),         data: daily.map(d => d.output),         backgroundColor: TOKEN_COLORS.output,         hoverBackgroundColor: TOKEN_HOVER.output,         stack: 'io',    yAxisID: 'y1' },
@@ -2224,7 +2303,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # Inject runtime config (version + surface) the page can't know at
             # author time. json.dumps produces a valid JS object literal for the
             # `window.APP_CONFIG = __APP_CONFIG_JSON__;` placeholder in the head.
-            config = json.dumps({"version": VERSION, "surface": SURFACE})
+            config = json.dumps({"version": VERSION, "surface": SURFACE,
+                                 "cost_share": COST_SHARE})
             html = HTML_TEMPLATE.replace("__APP_CONFIG_JSON__", config)
             body = html.encode("utf-8")
             self.send_response(200)
@@ -2291,6 +2371,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+
+# Share of the API list-price cost that serving the tokens costs Anthropic,
+# behind the "Est. Real Cost" card. 0.20 sits between SemiAnalysis's 70% and
+# 88% inference margins (cost 12-30% of revenue).
+COST_SHARE = float(os.environ.get("CLAUDE_USAGE_COST_SHARE", "0.20"))
 
 
 def serve(host=None, port=None, surface=None):
